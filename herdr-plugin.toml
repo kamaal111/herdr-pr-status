@@ -1,0 +1,27 @@
+id = "herdr-pr-status"
+name = "Herdr PR Status"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "Show the newest associated GitHub PR number beside each workspace"
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked", "--target-dir", "target"]
+
+[[startup]]
+command = ["./target/release/herdr-pr-status", "start"]
+
+[[actions]]
+id = "start"
+title = "Start automatic PR refresh"
+command = ["./target/release/herdr-pr-status", "start"]
+
+[[actions]]
+id = "refresh"
+title = "Refresh workspace PR numbers"
+command = ["./target/release/herdr-pr-status", "refresh"]
+
+[[actions]]
+id = "stop"
+title = "Stop automatic PR refresh"
+command = ["./target/release/herdr-pr-status", "stop"]
