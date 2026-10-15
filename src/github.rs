@@ -175,7 +175,150 @@ fn gh(checkout: &Checkout) -> Command {
     command
 }
 
-pub fn lookup(checkout: &Checkout) -> Result<Option<u64>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifecycle {
+    Open,
+    Draft,
+    Merged,
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CiStatus {
+    Passed,
+    Pending,
+    Failed,
+}
+
+impl CiStatus {
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Passed => "✅",
+            Self::Pending => "🟡",
+            Self::Failed => "❌",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrSummary {
+    pub number: u64,
+    pub lifecycle: Lifecycle,
+    pub ci: Option<CiStatus>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum PrState {
+    Open,
+    Closed,
+    Merged,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrDetails {
+    number: u64,
+    state: PrState,
+    is_draft: bool,
+    status_check_rollup: Option<Vec<Check>>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "__typename")]
+enum Check {
+    CheckRun {
+        status: CheckStatus,
+        conclusion: Option<Conclusion>,
+    },
+    StatusContext {
+        state: CommitStatus,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum CheckStatus {
+    Completed,
+    InProgress,
+    Pending,
+    Queued,
+    Requested,
+    Waiting,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum Conclusion {
+    #[serde(rename = "")]
+    Unset,
+    Success,
+    Neutral,
+    Skipped,
+    Failure,
+    Cancelled,
+    TimedOut,
+    ActionRequired,
+    Stale,
+    StartupFailure,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum CommitStatus {
+    Success,
+    Expected,
+    Pending,
+    Error,
+    Failure,
+}
+
+impl Check {
+    fn result(self) -> Result<Option<CiStatus>> {
+        Ok(match self {
+            Self::CheckRun {
+                status: CheckStatus::Completed,
+                conclusion,
+            } => match conclusion.context("completed GitHub check has no conclusion")? {
+                Conclusion::Unset => anyhow::bail!("completed GitHub check has empty conclusion"),
+                Conclusion::Success => Some(CiStatus::Passed),
+                Conclusion::Neutral | Conclusion::Skipped => None,
+                _ => Some(CiStatus::Failed),
+            },
+            Self::CheckRun { .. } => Some(CiStatus::Pending),
+            Self::StatusContext { state } => Some(match state {
+                CommitStatus::Success => CiStatus::Passed,
+                CommitStatus::Expected | CommitStatus::Pending => CiStatus::Pending,
+                CommitStatus::Error | CommitStatus::Failure => CiStatus::Failed,
+            }),
+        })
+    }
+}
+
+pub fn parse_summary(bytes: &[u8], expected_number: u64) -> Result<PrSummary> {
+    let details: PrDetails = serde_json::from_slice(bytes).context("parse GitHub PR details")?;
+    ensure!(
+        details.number > 0 && details.number == expected_number,
+        "GitHub PR details number mismatch"
+    );
+    let lifecycle = match details.state {
+        PrState::Merged => Lifecycle::Merged,
+        PrState::Closed => Lifecycle::Closed,
+        PrState::Open if details.is_draft => Lifecycle::Draft,
+        PrState::Open => Lifecycle::Open,
+    };
+    let mut ci = None;
+    for check in details.status_check_rollup.unwrap_or_default() {
+        ci = ci.max(check.result()?);
+    }
+    Ok(PrSummary {
+        number: details.number,
+        lifecycle,
+        ci,
+    })
+}
+
+pub fn lookup(checkout: &Checkout) -> Result<Option<PrSummary>> {
     let repository: Repository = serde_json::from_slice(&run(
         gh(checkout).args(["repo", "view", "--json", "nameWithOwner,url"]),
         Duration::from_secs(15),
@@ -219,5 +362,21 @@ pub fn lookup(checkout: &Checkout) -> Result<Option<u64>> {
         ]),
         Duration::from_secs(20),
     )?;
-    newest_pr(&output, checkout)
+    let Some(number) = newest_pr(&output, checkout)? else {
+        return Ok(None);
+    };
+    let repo = format!("{}/{}", checkout.host, repository.name_with_owner);
+    let output = run(
+        gh(checkout).args([
+            "pr",
+            "view",
+            &number.to_string(),
+            "--repo",
+            &repo,
+            "--json",
+            "number,state,isDraft,statusCheckRollup",
+        ]),
+        Duration::from_secs(20),
+    )?;
+    parse_summary(&output, number).map(Some)
 }
