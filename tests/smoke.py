@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Exercise the release binary with real Git and fake Herdr/GitHub boundaries."""
+import fcntl
 import json
 import os
 from pathlib import Path
 import socket
+import shutil
 import subprocess
 import tempfile
 import time
@@ -36,7 +38,19 @@ else:
         print("GitHub unavailable", file=sys.stderr)
         sys.exit(1)
     if args[:2] == ["repo", "view"]:
-        print('{"nameWithOwner":"alice/project","url":"https://github.com/alice/project"}')
+        print((root / "repository.json").read_text() if (root / "repository.json").exists()
+              else '{"nameWithOwner":"alice/project","url":"https://github.com/alice/project"}')
+    elif args[:2] == ["pr", "view"]:
+        if (root / "details-fail").exists():
+            print("PR details unavailable", file=sys.stderr)
+            sys.exit(1)
+        if (root / "details.json").exists():
+            print((root / "details.json").read_text())
+        else:
+            prs = json.loads((root / "prs.json").read_text())
+            selected = next(pr for pr in prs if pr["number"] == int(args[2]))
+            print(json.dumps({"number": selected["number"], "state": selected["state"].upper(),
+                "isDraft": False, "statusCheckRollup": []}))
     elif args[0] == "api":
         if (root / "branch-switch").exists():
             subprocess.run(["git", "checkout", "-q", "other"], check=True)
@@ -69,6 +83,7 @@ def pr(number, date="2026-10-01T00:00:00Z", branch="feature", repo="alice/projec
 
 class PluginSmoke(unittest.TestCase):
     def setUp(self):
+        self.binary = BINARY
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -113,8 +128,12 @@ class PluginSmoke(unittest.TestCase):
             "workspaces": workspaces, "panes": panes or [], "layouts": layouts or []}}})
 
     def run_plugin(self, action, check=True):
-        return subprocess.run([str(BINARY), action], env=self.env, capture_output=True,
-                              text=True, check=check, timeout=12)
+        result = subprocess.run([str(self.binary), action], env=self.env, capture_output=True,
+                                text=True, check=False, timeout=12)
+        if check:
+            self.assertEqual(result.returncode, 0,
+                             f"{action} failed: stdout={result.stdout!r}, stderr={result.stderr!r}")
+        return result
 
     def reports(self):
         return [json.loads(line) for line in (self.root / "reports").read_text().splitlines()]
@@ -124,11 +143,31 @@ class PluginSmoke(unittest.TestCase):
 
     def watcher_exited(self):
         self.assertIn("PR watcher stopped", next((self.root / "state").glob("*/watch.log")).read_text())
+        with next((self.root / "state").glob("*/watch.lock")).open("r+") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                self.fail("PR watcher still holds the session lock")
+
+    def wake_watcher(self, directory=None):
+        directory = directory or next((self.root / "state").glob("session-*"))
+        try:
+            descriptor = os.open(directory / "wake.pipe", os.O_WRONLY | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "wb") as pipe:
+                pipe.write(b"wake")
+        except (FileNotFoundError, BrokenPipeError):
+            eventually(self.watcher_exited)
 
     def stop_watcher(self):
         (self.root / "release").touch()
         for directory in (self.root / "state").glob("session-*"):
             (directory / "stop").touch()
+            try:
+                descriptor = os.open(directory / "wake.pipe", os.O_WRONLY | os.O_NONBLOCK)
+            except OSError:
+                continue
+            with os.fdopen(descriptor, "wb") as pipe:
+                pipe.write(b"stop")
         logs = list((self.root / "state").glob("*/watch.log"))
         if logs:
             eventually(self.watcher_exited, timeout=10)
@@ -138,11 +177,77 @@ class PluginSmoke(unittest.TestCase):
                                 pr(125, "2026-10-03T00:00:00Z", state="closed")])
         self.run_plugin("refresh")
         self.assertEqual(self.reports(), [["workspace", "report-metadata", "w1", "--source",
-            "herdr-pr-status", "--token", "pr_number=#125", "--ttl-ms", "180000"]])
+            "herdr-pr-status", "--token", "pr_number=#125",
+            "--clear-token", "pr_open", "--clear-token", "pr_draft", "--clear-token", "pr_merged",
+            "--token", "pr_closed=#125", "--ttl-ms", "180000"]])
         api_args = [args for kind, args in self.calls() if kind == "gh" and args[0] == "api"][0]
         self.assertIn("state=all", api_args)
         self.assertIn("head=alice:feature", api_args)
         self.assertIn("--paginate", api_args)
+
+    def test_details_are_scoped_to_selected_pr_base_repository_and_host(self):
+        self.run_plugin("refresh")
+        details_args = [args for kind, args in self.calls() if kind == "gh" and args[:2] == ["pr", "view"]]
+        self.assertEqual(details_args, [["pr", "view", "123", "--repo", "github.com/alice/project",
+            "--json", "number,state,isDraft,statusCheckRollup"]])
+
+    def test_fork_pr_details_use_resolved_base_repository_on_enterprise_host(self):
+        self.git("remote", "set-url", "origin", "git@github.example:alice/fork.git")
+        self.write("repository.json", {"nameWithOwner": "upstream/project",
+            "url": "https://github.example/upstream/project"})
+        self.write("prs.json", [pr(123, repo="alice/fork")])
+        self.run_plugin("refresh")
+        details_args = [args for kind, args in self.calls() if kind == "gh" and args[:2] == ["pr", "view"]][0]
+        api_args = [args for kind, args in self.calls() if kind == "gh" and args[0] == "api"][0]
+        self.assertEqual(details_args[details_args.index("--repo") + 1], "github.example/upstream/project")
+        self.assertEqual(api_args[api_args.index("--hostname") + 1], "github.example")
+        self.assertIn("repos/upstream/project/pulls", api_args)
+        self.assertIn("pr_open=#123", self.reports()[0])
+
+    def test_lifecycle_transitions_replace_tokens_and_ci_icons(self):
+        self.write("details.json", {"number": 123, "state": "OPEN", "isDraft": True,
+            "statusCheckRollup": [{"__typename": "CheckRun", "status": "QUEUED", "conclusion": ""}]})
+        self.run_plugin("refresh")
+        self.write("details.json", {"number": 123, "state": "OPEN", "isDraft": False,
+            "statusCheckRollup": [{"__typename": "StatusContext", "state": "FAILURE"}]})
+        self.run_plugin("refresh")
+        self.write("details.json", {"number": 123, "state": "MERGED", "isDraft": False,
+            "statusCheckRollup": [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]})
+        self.run_plugin("refresh")
+        self.assertIn("pr_draft=#123 🟡", self.reports()[0])
+        self.assertIn("pr_open=#123 ❌", self.reports()[1])
+        self.assertIn("pr_merged=#123", self.reports()[2])
+        self.assertNotIn("pr_merged=#123 ✅", self.reports()[2])
+        self.assertEqual([r[r.index("--clear-token") + 1] for r in self.reports()],
+                         ["pr_open", "pr_draft", "pr_open"])
+        self.assertEqual(self.reports()[1][9:11], ["--clear-token", "pr_draft"])
+        self.assertEqual(self.reports()[2][9:11], ["--clear-token", "pr_draft"])
+
+    def test_empty_result_clears_all_owned_tokens(self):
+        self.write("prs.json", [])
+        self.run_plugin("refresh")
+        self.assertEqual(self.reports(), [["workspace", "report-metadata", "w1", "--source",
+            "herdr-pr-status", "--clear-token", "pr_open", "--clear-token", "pr_draft",
+            "--clear-token", "pr_merged", "--clear-token", "pr_closed", "--clear-token", "pr_number"]])
+        self.assertEqual([args for kind, args in self.calls() if kind == "gh" and args[:2] == ["pr", "view"]], [])
+
+    def test_details_failure_preserves_all_metadata_then_recovers(self):
+        self.run_plugin("refresh")
+        previous = self.reports()
+        (self.root / "details-fail").touch()
+        result = self.run_plugin("refresh", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("PR details unavailable", result.stderr)
+        self.assertEqual(self.reports(), previous)
+        (self.root / "details-fail").unlink()
+        self.run_plugin("refresh")
+        self.assertEqual(self.reports(), previous + previous)
+
+    def test_malformed_details_preserve_all_metadata(self):
+        self.write("details.json", {"number": 123})
+        result = self.run_plugin("refresh", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse((self.root / "reports").exists())
 
     def test_metadata_command_failure_is_reported(self):
         (self.root / "report-fail").touch()
@@ -180,6 +285,7 @@ class PluginSmoke(unittest.TestCase):
         self.run_plugin("refresh")
         self.assertEqual(len([args for kind, args in self.calls() if kind == "gh" and args[0] == "api"]), 1)
         self.assertEqual(len(self.reports()), 2)
+        self.assertEqual(len([args for kind, args in self.calls() if kind == "gh" and args[:2] == ["pr", "view"]]), 1)
 
     def test_branch_change_during_lookup_clears_stale_number(self):
         (self.root / "branch-switch").touch()
@@ -242,11 +348,121 @@ class PluginSmoke(unittest.TestCase):
         self.run_plugin("stop")
         eventually(self.watcher_exited)
         self.assertEqual(len(self.reports()), 1)
+        self.assertFalse(next((self.root / "state").glob("session-*")).joinpath("wake.pipe").exists())
+        self.assertFalse(next((self.root / "state").glob("session-*")).joinpath("watcher.json").exists())
+
+    def test_start_acknowledges_locked_watcher_before_first_lookup_finishes(self):
+        (self.root / "blocked").touch()
+        result = self.run_plugin("start")
+        self.assertIn("PR watcher started", result.stdout)
+        eventually(lambda: self.assertTrue((self.root / "entered").exists()))
+        with next((self.root / "state").glob("*/watch.lock")).open("r+") as lock:
+            self.assertRaises(BlockingIOError, fcntl.flock, lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.assertIn("already running", self.run_plugin("start").stdout)
+        self.run_plugin("stop")
+        (self.root / "release").touch()
+        eventually(self.watcher_exited)
+        self.assertFalse((self.root / "reports").exists())
+
+    def test_start_replaces_legacy_watcher_without_identity(self):
+        self.run_plugin("start")
+        eventually(lambda: self.assertTrue((self.root / "reports").exists()))
+        (next((self.root / "state").glob("session-*")) / "watcher.json").unlink(missing_ok=True)
+        result = self.run_plugin("start")
+        self.assertIn("Replacing outdated PR watcher", result.stdout)
+        eventually(lambda: self.assertEqual(len(self.reports()), 2))
+        self.run_plugin("stop")
+        eventually(lambda: self.assertEqual(next((self.root / "state").glob("*/watch.log")).read_text().count("PR watcher stopped"), 2))
+
+    def test_start_replaces_watcher_from_another_checkout(self):
+        self.binary = self.root / "first-plugin"
+        shutil.copy2(BINARY, self.binary)
+        self.run_plugin("start")
+        eventually(lambda: self.assertTrue((self.root / "reports").exists()))
+        self.binary = self.root / "second-plugin"
+        shutil.copy2(BINARY, self.binary)
+        result = self.run_plugin("start")
+        self.assertIn("Replacing outdated PR watcher", result.stdout)
+        eventually(lambda: self.assertEqual(len(self.reports()), 2))
+        self.assertIn("already running", self.run_plugin("start").stdout)
+
+    def test_watcher_reloads_replaced_binary_without_start_or_refresh(self):
+        self.binary = self.root / "installed-plugin"
+        shutil.copy2(BINARY, self.binary)
+        self.run_plugin("start")
+        eventually(lambda: self.assertTrue((self.root / "reports").exists()))
+        self.write("prs.json", [pr(987)])
+        replacement = self.root / "replacement-plugin"
+        shutil.copy2(BINARY, replacement)
+        replacement.replace(self.binary)
+        self.wake_watcher()
+        eventually(lambda: self.assertEqual(len(self.reports()), 2), timeout=12)
+        self.assertIn("pr_open=#987", self.reports()[1])
+        self.assertIn("PR watcher binary changed; reloading", next((self.root / "state").glob("*/watch.log")).read_text())
+        self.assertIn("already running", self.run_plugin("start").stdout)
+
+    def test_watcher_follows_registered_update_after_old_checkout_is_removed(self):
+        old_root = self.root / "old-plugin"
+        self.binary = old_root / "target/release/herdr-pr-status"
+        self.binary.parent.mkdir(parents=True)
+        shutil.copy2(BINARY, self.binary)
+        self.write("plugins.json", {"result": {"plugins": [{"plugin_id": "herdr-pr-status",
+            "enabled": True, "plugin_root": str(old_root)}]}})
+        self.run_plugin("start")
+        eventually(lambda: self.assertTrue((self.root / "reports").exists()))
+        new_root = self.root / "new-plugin"
+        self.binary = new_root / "target/release/herdr-pr-status"
+        self.binary.parent.mkdir(parents=True)
+        shutil.copy2(BINARY, self.binary)
+        self.write("prs.json", [pr(987)])
+        self.write("plugins.json", {"result": {"plugins": [{"plugin_id": "herdr-pr-status",
+            "enabled": True, "plugin_root": str(new_root)}]}})
+        shutil.rmtree(old_root)
+        self.wake_watcher()
+        eventually(lambda: self.assertEqual(len(self.reports()), 2), timeout=12)
+        self.assertIn("pr_open=#987", self.reports()[1])
+        self.assertIn("already running", self.run_plugin("start").stdout)
+
+    def test_watcher_keeps_running_after_failed_reload_and_recovers(self):
+        self.binary = self.root / "installed-plugin"
+        shutil.copy2(BINARY, self.binary)
+        self.run_plugin("start")
+        eventually(lambda: self.assertTrue((self.root / "reports").exists()))
+        replacement = self.root / "replacement-plugin"
+        shutil.copy2(BINARY, replacement)
+        replacement.chmod(0o600)
+        replacement.replace(self.binary)
+        self.wake_watcher()
+        log = next((self.root / "state").glob("*/watch.log"))
+        eventually(lambda: self.assertIn("update deferred; current watcher retained", log.read_text()), timeout=12)
+        self.assertNotIn("PR watcher stopped", log.read_text())
+        self.write("prs.json", [pr(987)])
+        self.binary.chmod(0o700)
+        self.wake_watcher()
+        eventually(lambda: self.assertEqual(len(self.reports()), 2), timeout=12)
+        self.assertIn("pr_open=#987", self.reports()[1])
+        self.assertIn("already running", self.run_plugin("start").stdout)
+
+    def test_stop_during_binary_update_does_not_reload_or_report(self):
+        self.binary = self.root / "installed-plugin"
+        shutil.copy2(BINARY, self.binary)
+        (self.root / "blocked").touch()
+        self.run_plugin("start")
+        eventually(lambda: self.assertTrue((self.root / "entered").exists()))
+        replacement = self.root / "replacement-plugin"
+        shutil.copy2(BINARY, replacement)
+        replacement.replace(self.binary)
+        self.run_plugin("stop")
+        (self.root / "release").touch()
+        eventually(self.watcher_exited)
+        self.assertFalse((self.root / "reports").exists())
+        self.assertEqual(next((self.root / "state").glob("*/watch.log")).read_text().count("PR watcher started"), 1)
 
     def test_watcher_exits_on_plugin_disable(self):
         self.run_plugin("start")
         eventually(lambda: self.assertTrue((self.root / "reports").exists()))
         self.write("plugins.json", {"result": {"plugins": [{"plugin_id": "herdr-pr-status", "enabled": False}]}})
+        self.wake_watcher()
         eventually(self.watcher_exited)
         self.assertEqual(len(self.reports()), 1)
 
@@ -267,6 +483,7 @@ class PluginSmoke(unittest.TestCase):
         self.run_plugin("start")
         eventually(lambda: self.assertTrue((self.root / "reports").exists()))
         self.write("plugins.json", {"result": {"plugins": []}})
+        self.wake_watcher()
         eventually(self.watcher_exited)
         self.assertEqual(len(self.reports()), 1)
 
@@ -276,6 +493,11 @@ class PluginSmoke(unittest.TestCase):
         self.write("prs.json", [pr(987)])
         eventually(lambda: self.assertEqual(len(self.reports()), 2), timeout=75)
         self.assertEqual(self.reports()[1][6], "pr_number=#987")
+        calls = self.calls()
+        report_positions = [index for index, (kind, args) in enumerate(calls)
+            if kind == "herdr" and args[:2] == ["workspace", "report-metadata"]]
+        self.assertEqual(len([args for kind, args in calls[:report_positions[1]]
+            if kind == "herdr" and args == ["plugin", "list", "--json"]]), 9)
         self.run_plugin("stop")
         eventually(self.watcher_exited)
 
@@ -286,6 +508,7 @@ class PluginSmoke(unittest.TestCase):
         replacement = socket.socket(socket.AF_UNIX)
         self.addCleanup(replacement.close)
         replacement.bind(self.env["HERDR_SOCKET_PATH"])
+        self.wake_watcher()
         eventually(self.watcher_exited)
         self.assertEqual(len(self.reports()), 1)
 
@@ -293,6 +516,7 @@ class PluginSmoke(unittest.TestCase):
         self.run_plugin("start")
         eventually(lambda: self.assertTrue((self.root / "reports").exists()))
         Path(self.env["HERDR_SOCKET_PATH"]).unlink()
+        self.wake_watcher()
         eventually(self.watcher_exited)
         self.assertEqual(len(self.reports()), 1)
 

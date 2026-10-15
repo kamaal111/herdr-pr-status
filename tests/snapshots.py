@@ -26,7 +26,14 @@ OUTPUT = Path("/output")
 BASELINES = Path("/baselines")
 FONTS = ROOT / "tests/snapshots/fonts"
 CASES = ("grouped-worktree-pr", "client-config-without-token", "client-config-with-token",
-         "client-config-reload", "cleared-pr")
+         "client-config-reload", "cleared-pr", "pr-draft-pending", "pr-open-failed",
+         "pr-merged-passed", "pr-closed-no-checks")
+PR_CASES = {
+    "pr-draft-pending": ("OPEN", True, "PENDING", "8b949e", "🟡"),
+    "pr-open-failed": ("OPEN", False, "FAILURE", "238636", "❌"),
+    "pr-merged-passed": ("MERGED", False, "SUCCESS", "a371f7", ""),
+    "pr-closed-no-checks": ("CLOSED", False, None, "f85149", ""),
+}
 ANSI = dict(zip(
     ("black", "red", "green", "brown", "blue", "magenta", "cyan", "white",
      "brightblack", "brightred", "brightgreen", "brightbrown", "brightblue",
@@ -54,6 +61,7 @@ def rasterize(grid, light=False):
     draw = ImageDraw.Draw(image)
     regular = ImageFont.truetype(str(FONTS / "DejaVuSansMono.ttf"), 16)
     bold = ImageFont.truetype(str(FONTS / "DejaVuSansMono-Bold.ttf"), 16)
+    emoji = ImageFont.truetype(str(FONTS / "NotoEmoji.ttf"), 16)
     for index, cell in enumerate(grid["cells"]):
         x, y = index % grid["width"] * 10, index // grid["width"] * 20
         fg, bg = color(cell["fg"], foreground), color(cell["bg"], background)
@@ -63,7 +71,8 @@ def rasterize(grid, light=False):
     for index, cell in enumerate(grid["cells"]):
         x, y = index % grid["width"] * 10, index // grid["width"] * 20
         fg = color(cell["bg"], background) if cell["reverse"] else color(cell["fg"], foreground)
-        draw.text((x, y + 1), cell["text"], font=bold if cell["bold"] else regular, fill=fg)
+        font = emoji if cell["text"] in ("✅", "❌", "🟡") else bold if cell["bold"] else regular
+        draw.text((x, y + 1), cell["text"], font=font, fill=fg)
         if cell["underline"]:
             draw.line((x, y + 18, x + 9, y + 18), fill=fg)
     return image
@@ -202,6 +211,47 @@ class Session:
     def api(self, *args):
         return json.loads(self.run("herdr", "--session", "snapshot", *args))["result"]
 
+    def action(self, action):
+        invocation = self.api("plugin", "action", "invoke", f"herdr-pr-status.{action}")
+        log_id = invocation["log"]["log_id"]
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            logs = self.api("plugin", "log", "list", "--plugin", "herdr-pr-status", "--limit", "20")["logs"]
+            completed = next((log for log in logs if log["log_id"] == log_id and log["status"] != "running"), None)
+            if completed is not None:
+                assert completed["status"] == "succeeded", completed
+                return completed
+            time.sleep(.05)
+        raise TimeoutError(f"Plugin action {action} did not finish: {logs}")
+
+    def refresh(self):
+        completed = self.action("refresh")
+        assert "already in progress" not in (completed.get("stdout") or ""), completed
+
+    def stop_startup_watcher(self):
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            logs = self.api("plugin", "log", "list", "--plugin", "herdr-pr-status", "--limit", "20")["logs"]
+            startup = next((log for log in logs if log.get("event") == "startup" and log["status"] != "running"), None)
+            if startup is not None:
+                assert startup["status"] == "succeeded", startup
+                break
+            time.sleep(.05)
+        else:
+            raise TimeoutError(f"Plugin startup did not finish: {logs}")
+        self.action("stop")
+        lock_path = next((self.directory / "state/herdr/plugins/herdr-pr-status").glob("session-*/watch.lock"))
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            with lock_path.open("r+") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return
+                except BlockingIOError:
+                    pass
+            time.sleep(.05)
+        raise TimeoutError("Startup watcher did not release its session lock")
+
     def wait_api(self, predicate, timeout=20):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -239,9 +289,17 @@ enabled = false
 import json,sys,pathlib
 if sys.argv[1:3] == ["repo","view"]:
     print(json.dumps({"nameWithOwner":"snapshot/TCG","url":"https://github.com/snapshot/TCG"}))
+elif sys.argv[1:3] == ["pr","view"]:
+    print(pathlib.Path(__file__).with_name("details.json").read_text())
 else:
     print(json.dumps([{"number":95,"created_at":"2026-10-01T00:00:00Z","head":{"ref":"export-import","repo":{"full_name":"snapshot/TCG"}}}] if "head=snapshot:export-import" in sys.argv and not pathlib.Path(__file__).with_name("empty").exists() else []))
 ''')
+        state, draft, ci, _, _ = PR_CASES.get(self.case, ("OPEN", False, None, "238636", ""))
+        checks = [] if ci is None else [{"__typename": "StatusContext", "state": ci}]
+        if ci == "PENDING":
+            checks = [{"__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": ""}]
+        (fake.parent / "details.json").write_text(json.dumps({"number": 95,
+            "state": state, "isDraft": draft, "statusCheckRollup": checks}))
         fake.chmod(0o755)
         plugin = self.directory / "plugin"
         (plugin / "target/release").mkdir(parents=True)
@@ -261,6 +319,7 @@ else:
                 time.sleep(.05)
         else:
             raise TimeoutError("Herdr server did not start")
+        self.stop_startup_watcher()
         original = self.api("api", "snapshot")["snapshot"]["workspaces"]
         repo = self.directory / "TCG"
         self.run("git", "init", "-b", "main", str(repo))
@@ -281,8 +340,8 @@ else:
         self.client_config.write_text(self.base_config + (self.sidebar_config if client_has_token else ""))
         client_environment["HERDR_CONFIG_PATH"] = str(self.client_config)
         self.client = Client(client_environment, 120, 30, self.directory)
-        self.client.wait("export-import", "no-pr", "$")
-        self.api("plugin", "action", "invoke", "herdr-pr-status.refresh")
+        self.client.wait("TCG", "no-pr", "$")
+        self.refresh()
         self.wait_api(lambda s: any(w.get("tokens", {}).get("pr_number") == "#95" for w in s["workspaces"]))
 
     def capture(self):
@@ -295,11 +354,16 @@ else:
             assert "#95" not in "\n".join(self.client.screen.display)
             self.client_config.write_text(self.base_config + self.sidebar_config)
             self.client.send(b"\x02R")
-        grid = self.client.wait("#95", "no-pr")
+        _, _, _, expected_color, icon = PR_CASES.get(self.case, ("OPEN", False, None, "238636", ""))
+        grid = self.client.wait(f"#95 {icon}".rstrip(), "no-pr")
+        line_index = next(y for y, line in enumerate(self.client.screen.display) if "#95" in line)
+        column = self.client.screen.display[line_index].index("#95")
+        assert [self.client.screen.buffer[line_index][x].fg for x in range(column, column + 3)] == [expected_color] * 3
         assert "#95" in "\n".join(self.client.screen.display)
+        assert [symbol for symbol in ("✅", "❌", "🟡") if symbol in self.client.screen.display[line_index]] == ([icon] if icon else [])
         if self.case == "cleared-pr":
             (self.directory / "bin/empty").touch()
-            self.api("plugin", "action", "invoke", "herdr-pr-status.refresh")
+            self.refresh()
             self.wait_api(lambda s: all("pr_number" not in w.get("tokens", {}) for w in s["workspaces"]))
             grid = self.client.wait("export-import", "no-pr")
             assert "#95" not in "\n".join(self.client.screen.display)
@@ -312,6 +376,8 @@ else:
             self.client.close()
         if self.server:
             try:
+                logs = self.api("plugin", "log", "list", "--plugin", "herdr-pr-status", "--limit", "20")
+                (output / "plugin.log").write_text(json.dumps(logs, indent=2))
                 self.api("plugin", "action", "invoke", "herdr-pr-status.stop")
                 self.run("herdr", "--session", "snapshot", "server", "stop")
             except (RuntimeError, subprocess.TimeoutExpired):

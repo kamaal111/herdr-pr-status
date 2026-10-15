@@ -1,4 +1,7 @@
-use crate::command::run;
+use crate::{
+    command::run,
+    github::{Lifecycle, PrSummary},
+};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::{
@@ -99,9 +102,10 @@ struct PluginResult {
     plugins: Vec<Plugin>,
 }
 #[derive(Deserialize)]
-struct Plugin {
+pub struct Plugin {
     plugin_id: String,
-    enabled: bool,
+    pub enabled: bool,
+    pub plugin_root: Option<PathBuf>,
 }
 
 pub fn cli(args: &[&str]) -> Result<Vec<u8>> {
@@ -123,30 +127,55 @@ pub fn snapshot() -> Result<Snapshot> {
     Ok(envelope.result.snapshot)
 }
 
-pub fn enabled() -> Result<bool> {
+pub fn installation() -> Result<Option<Plugin>> {
     let envelope: PluginEnvelope = serde_json::from_slice(&cli(&["plugin", "list", "--json"])?)
         .context("parse Herdr plugin list")?;
     Ok(envelope
         .result
         .plugins
-        .iter()
-        .any(|p| p.plugin_id == SOURCE && p.enabled))
+        .into_iter()
+        .find(|plugin| plugin.plugin_id == SOURCE))
 }
 
-pub fn report(workspace_id: &str, number: Option<u64>) -> Result<()> {
-    let value = number.map(|n| format!("{TOKEN}=#{n}"));
+pub fn enabled() -> Result<bool> {
+    Ok(installation()?.is_some_and(|plugin| plugin.enabled))
+}
+
+const LIFECYCLE_TOKENS: [(Lifecycle, &str); 4] = [
+    (Lifecycle::Open, "pr_open"),
+    (Lifecycle::Draft, "pr_draft"),
+    (Lifecycle::Merged, "pr_merged"),
+    (Lifecycle::Closed, "pr_closed"),
+];
+
+pub fn report(workspace_id: &str, pr: Option<PrSummary>) -> Result<()> {
     let mut args = vec![
-        "workspace",
-        "report-metadata",
-        workspace_id,
-        "--source",
-        SOURCE,
+        "workspace".to_owned(),
+        "report-metadata".to_owned(),
+        workspace_id.to_owned(),
+        "--source".to_owned(),
+        SOURCE.to_owned(),
     ];
-    if let Some(value) = &value {
-        args.extend(["--token", value, "--ttl-ms", "180000"]);
-    } else {
-        args.extend(["--clear-token", TOKEN]);
+    if let Some(pr) = pr {
+        args.extend(["--token".into(), format!("{TOKEN}=#{}", pr.number)]);
     }
-    cli(&args)?;
+    for (lifecycle, token) in LIFECYCLE_TOKENS {
+        if let Some(pr) = pr.filter(|pr| pr.lifecycle == lifecycle) {
+            let suffix = pr
+                .ci
+                .filter(|_| lifecycle != Lifecycle::Merged)
+                .map(|ci| format!(" {}", ci.icon()))
+                .unwrap_or_default();
+            args.extend(["--token".into(), format!("{token}=#{}{suffix}", pr.number)]);
+        } else {
+            args.extend(["--clear-token".into(), token.into()]);
+        }
+    }
+    if pr.is_some() {
+        args.extend(["--ttl-ms".into(), "180000".into()]);
+    } else {
+        args.extend(["--clear-token".into(), TOKEN.into()]);
+    }
+    cli(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
     Ok(())
 }
