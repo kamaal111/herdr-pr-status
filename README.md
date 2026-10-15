@@ -18,19 +18,28 @@ by exact head repository and branch, not by commit ancestry.
 
 This repository follows the Cargo, Just, rustfmt, Clippy, release build, and
 macOS/Linux CI conventions of `herdr-picker`. It has no custom terminal renderer
-and therefore does not need Ratatui, picker navigation tests, or PNG baselines.
+and therefore does not need Ratatui or picker navigation tests. Real Herdr sidebar
+PNG snapshots verify the rendered integration.
 
 ## Build and activate
 
-The following are opt-in commands. Building and testing do not change your
-Herdr settings or register the plugin.
+Run this once from the checkout **on the Herdr server computer**. It builds the
+release binary and registers the plugin:
 
 ```sh
-just ready
 just plugin-link
 ```
 
-Merge `$pr_number` into your existing Herdr `[ui.sidebar.spaces]` rows. If you
+For remote use, the plugin, `git`, and authenticated `gh` belong on the server;
+the sidebar configuration below belongs on the computer displaying the client.
+
+**Edit the config on the computer displaying the Herdr sidebar.** When connected
+remotely, installing the plugin on the server and editing the server’s config
+are not enough: sidebar layouts come from the viewing computer’s local config.
+Use `~/.config/herdr/config.toml` on macOS/Linux or
+`%APPDATA%\herdr\config.toml` on Windows (`HERDR_CONFIG_PATH` overrides these).
+
+Merge `$pr_number` into that config’s existing `[ui.sidebar.spaces]` rows. If you
 have no custom layout, use:
 
 ```toml
@@ -53,8 +62,20 @@ Start automatic refresh in an already running session:
 just plugin-start
 ```
 
-The startup hook starts it automatically after future session restores. Linking
-alone should not be relied on to start the watcher in an existing session.
+**You do not run `plugin-start` every time you open Herdr or start a server.**
+The startup hook starts the watcher automatically after each server startup.
+Installing/linking into an already-running server does not run that hook, so
+`just plugin-start` activates it once without waiting for the next server start.
+Reloading sidebar configuration does not require restarting the plugin.
+
+| Situation | What to do |
+| --- | --- |
+| First install/link while the server is running | Run `just plugin-start` once. |
+| Herdr server starts or restarts | Nothing; the startup hook runs automatically. |
+| Client closes, reopens, or reconnects | Nothing; the server-side watcher keeps running. |
+| Sidebar config changes | Reload config in the viewing client; keep the watcher running. |
+| Plugin was stopped, disabled/re-enabled, or watcher exited | Run `just plugin-start` to resume. |
+
 Commands launched through plugin actions inherit the session socket and plugin
 state directory. For multiple sessions, invoke the action in each desired
 session, using `herdr --session NAME plugin action invoke herdr-pr-status.start`.
@@ -70,6 +91,42 @@ The equivalent qualified actions are `herdr-pr-status.start`,
 `herdr-pr-status.refresh`, and `herdr-pr-status.stop`. The `check` command can
 also be run directly as `./target/release/herdr-pr-status check` in a shell with
 Herdr session context. No command edits Herdr’s configuration.
+
+## PR number not visible?
+
+1. **Check the viewing computer’s config first.** This is especially important
+   with `herdr --remote`: changing only the server’s config does not change the
+   client’s sidebar. Run `herdr --help` on the viewing computer, outside any SSH
+   shell, to see its resolved config path. Add `$pr_number` there and select
+   **Reload config in that client’s in-app menu**. The server CLI reload command
+   does not reload the remote client’s local sidebar layout.
+2. **Use the expanded desktop sidebar.** Collapsed/mobile views do not render
+   these custom rows. Expand a collapsed repository group to see its worktrees.
+3. **Check whether metadata exists on the server.** Run `herdr workspace list`
+   to find the workspace ID, then `herdr workspace get WORKSPACE_ID`. A token
+   such as `"pr_number": "#95"` means the association has already been reported;
+   focus on the viewing client’s config and layout rather than restarting the
+   watcher.
+4. **If metadata is absent, check discovery and refresh on the server.** Run
+   `just plugin-check` for read-only association results and errors, then
+   `just plugin-refresh` to request a refresh. Ensure `gh` can access the
+   repository, the checkout is on a branch, and its remote points to GitHub.
+5. **Inspect completed action logs and watcher diagnostics.** Run:
+
+   ```sh
+   herdr plugin log list --plugin herdr-pr-status --limit 5
+   ```
+
+   Actions run asynchronously: an invocation response with `status: running`
+   is not confirmation that the action finished successfully. The completed
+   start log prints the `watch.log` path. Inspect that file for per-workspace
+   errors and a summary such as `12 workspace reports, 0 failures`. If the
+   watcher exited, run `just plugin-start` after fixing the reported cause.
+
+Allow one refresh cycle for new workspaces or branch changes: the watcher waits
+60 seconds between completed cycles. `just plugin-refresh` requests an immediate
+cycle; it does not restart the watcher. Starting it again is unnecessary when
+metadata is already present.
 
 ## Discovery and refresh
 
@@ -153,6 +210,33 @@ resolution after 15 seconds and PR listing after 20 seconds. Captured command
 output is limited to 4 MiB per stream. Timeouts terminate and reap the child’s
 process group. Arguments are passed directly, without shell interpolation.
 
+### Real sidebar snapshot tests
+
+With Docker running:
+
+```sh
+just test-snapshots
+just test-snapshots --repeat 2
+just record-snapshots
+```
+
+The pinned Linux x86_64 container runs real Herdr 0.9.5 servers, terminal clients,
+Git repositories, linked worktrees, and the release plugin. Only GitHub is faked.
+It captures terminal cells into PNGs with pinned fonts and checks committed
+baselines. Recording is explicit and disabled in CI. Existing host sessions,
+configuration, and plugin registrations are never used.
+
+Five cases verify grouped `export-import · #95`, a separate client config missing
+the token (metadata exists but the PR is invisible), the client config containing
+the token, adding the token and reloading the client, and clearing the PR. These
+use independently configured clients and servers over temporary local sockets;
+they exercise configuration ownership without requiring an SSH server.
+
+CI compares all five twice and uploads actual/expected/difference PNGs, screen
+text, terminal ANSI output, and server logs. Local diagnostics live under
+`target/snapshots/CASE/`. Review baseline images before committing. Snapshot
+comparison is a separate required check alongside `just ready`.
+
 ### Manual integration check before release
 
 Use a disposable Herdr session and isolated configuration/state directories.
@@ -165,5 +249,9 @@ updates immediately. Disable/unlink the plugin and confirm the watcher exits
 and the token disappears within 180 seconds. Check narrow/collapsed sidebar
 behavior is controlled by Herdr. Shut down and remove the disposable session.
 
-Actual sidebar rendering and live GitHub authentication/API behavior require
-this manual check; automated tests do not modify your live Herdr installation.
+Live GitHub authentication/API behavior and the actual remote transport still
+require this manual check. Sidebar rendering and client-config ownership are
+covered by the isolated snapshot suite.
+
+Snapshot fonts are DejaVu Sans Mono 2.37, redistributed under the
+[Bitstream Vera license](tests/snapshots/fonts/LICENSE).

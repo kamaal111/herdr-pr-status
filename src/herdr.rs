@@ -147,11 +147,6 @@ pub fn report(workspace_id: &str, number: Option<u64>) -> Result<()> {
     } else {
         args.extend(["--clear-token", TOKEN]);
     }
-    let response: serde_json::Value =
-        serde_json::from_slice(&cli(&args)?).context("parse metadata report response")?;
-    ensure!(
-        response.get("result").is_some() && response.get("error").is_none(),
-        "metadata report rejected: {response}"
-    );
+    cli(&args)?;
     Ok(())
 }

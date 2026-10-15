@@ -26,7 +26,9 @@ if kind == "herdr":
     elif args[:2] == ["workspace", "report-metadata"]:
         with (root / "reports").open("a") as f:
             f.write(json.dumps(args) + "\n")
-        print('{"result":{"type":"workspace_info"}}')
+        if (root / "report-fail").exists():
+            print("metadata rejected", file=sys.stderr)
+            sys.exit(1)
     else:
         sys.exit(11)
 else:
@@ -141,6 +143,12 @@ class PluginSmoke(unittest.TestCase):
         self.assertIn("state=all", api_args)
         self.assertIn("head=alice:feature", api_args)
         self.assertIn("--paginate", api_args)
+
+    def test_metadata_command_failure_is_reported(self):
+        (self.root / "report-fail").touch()
+        result = self.run_plugin("refresh", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("metadata rejected", result.stderr)
 
     def test_empty_result_clears_only_owned_token(self):
         self.write("prs.json", [])
