@@ -21,21 +21,11 @@ lint:
 
 test:
     cargo test --locked --all-features
-
-test-smoke: build-release
-    python3 tests/smoke.py
-
-# Compare real Herdr sidebar PNG snapshots in the pinned Linux container
-test-snapshots *args:
-    sh tests/snapshots/run.sh {{args}}
-
-# Intentionally update and review visual baselines (disabled in CI)
-record-snapshots *cases:
-    sh tests/snapshots/run.sh --record {{cases}}
+    uv run --locked pytest
 
 quality: format-check lint
 
-ready: quality test test-smoke
+ready: quality test
 
 plugin-link: build-release
     "${HERDR_BIN_PATH:-herdr}" plugin link "$PWD"

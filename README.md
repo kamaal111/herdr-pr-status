@@ -8,8 +8,62 @@ Merged PRs and PRs without actionable checks show no check icon.
 ## Installation
 
 Requires macOS or Linux, Herdr 0.9.5 or later, Git, Rust/Cargo (Rust 1.89 minimum),
-and authenticated [GitHub CLI](https://cli.github.com/). Run on the Herdr server
-computer, with `git` and `gh` on its PATH:
+curl, Python 3, and authenticated [GitHub CLI](https://cli.github.com/).
+Run on the computer hosting both the Herdr server and viewing client:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kamaal111/herdr-pr-status/main/install.sh | bash
+```
+
+The installer resolves the latest published stable release, installs that exact
+tag through Herdr, initializes the local sidebar configuration, and requests
+watcher startup if a session is running. Then select **Reload config** in the
+viewing client's menu. If no session is running, the startup hook activates the
+watcher when the server starts. Authenticate `gh` on the server with
+`gh auth login`; the installer never changes your authentication.
+
+Run the same command again to install the newest release. Configuration is set
+up **once per config path**, tracked outside `config.toml`. Repeated installs
+leave it untouched, even if you later edit/remove tokens or delete the file.
+Only a new explicit config migration can modify it again; ordinary plugin
+releases do not trigger config edits. Existing rows, styles, comments, and
+unrelated settings are preserved; legacy `$pr_number` tokens are upgraded.
+Invalid or incompatible layouts cause an error without changing the file.
+
+`HERDR_CONFIG_PATH` selects a different config; `HERDR_BIN_PATH` selects a
+different Herdr executable. Migration records and backups live under
+`${XDG_STATE_HOME:-$HOME/.local/state}/herdr-pr-status/configs/`, outside the
+plugin installation. Keep these records to retain the once-only guarantee.
+
+The installer requires a published release containing the `configure` command.
+Older releases such as `0.1.0` require the manual sidebar setup below.
+
+### Remote server and separate viewing computer
+
+On the **server**, install without touching its sidebar configuration:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kamaal111/herdr-pr-status/main/install.sh | bash -s -- --plugin-only
+```
+
+On the **viewing computer**, configure without registering a plugin:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kamaal111/herdr-pr-status/main/install.sh | bash -s -- --config-only
+```
+
+Config-only setup needs curl, Python 3, tar, and Rust/Cargo: it temporarily builds
+the release's config helper and removes the temporary source/build afterward.
+It needs no GitHub authentication, `gh`, or running server. On Windows clients,
+use the manual sidebar instructions below.
+
+Use `bash install.sh --help` or `bash install.sh --dry-run` from a checkout to
+inspect the options or preview setup without making changes.
+
+### Manual installation
+
+For manual source installation, run on the Herdr server computer with `git` and
+authenticated `gh` on its PATH:
 
 ```sh
 gh auth login
@@ -25,13 +79,16 @@ a client does not stop it. For multiple sessions, invoke the action in each one:
 herdr --session work plugin action invoke herdr-pr-status.start
 ```
 
-To update, run on each server computer:
+To update a manual installation, run on each server computer:
 
 ```sh
 herdr plugin update herdr-pr-status
 ```
 
-Installations build from source and follow `main`. Running watchers detect
+Manual installations without `--ref` build from source and follow `main`.
+The scripted installer pins a release tag; rerun the script to select a newer
+release (`plugin update` alone follows the previously installed ref).
+Running watchers detect
 updates between refresh cycles. If switching from a local development link,
 run `herdr plugin unlink herdr-pr-status` before installing; your source files
 and sidebar configuration are preserved.
