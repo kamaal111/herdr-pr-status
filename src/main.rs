@@ -13,13 +13,14 @@ fn execute() -> Result<()> {
         "refresh" => Session::load()?.refresh(true),
         "stop" => Session::load()?.stop(),
         "check" => watcher::check(),
+        "configure" => herdr_pr_status::configure::run(),
         "--version" | "-V" => {
             println!("herdr-pr-status {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         "--help" | "-h" => {
             println!(
-                "herdr-pr-status\n\nstart    Start one background watcher per Herdr session\nrefresh  Refresh workspace PR metadata once\nstop     Request watcher shutdown\ncheck    Read PR associations without reporting metadata\nwatch    Internal watcher entrypoint\n\nRequires git and authenticated gh. No local Herdr settings are edited."
+                "herdr-pr-status\n\nstart    Start one background watcher per Herdr session\nrefresh  Refresh workspace PR metadata once\nstop     Request watcher shutdown\ncheck    Read PR associations without reporting metadata\nconfigure Apply pending local sidebar config migrations once\nwatch    Internal watcher entrypoint\n\nWatcher commands require git and authenticated gh and never edit settings.\nconfigure honors HERDR_CONFIG_PATH and records migrations outside config."
             );
             Ok(())
         }

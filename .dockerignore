@@ -1,0 +1,9 @@
+*
+!tests/
+tests/*
+!tests/snapshots/
+tests/snapshots/*
+!tests/snapshots/Dockerfile
+!pyproject.toml
+!uv.lock
+!.python-version

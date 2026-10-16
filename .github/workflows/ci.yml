@@ -4,12 +4,26 @@ permissions:
   contents: read
 jobs:
   verify:
+    name: verify (${{ matrix.os }})
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            pytest_options: '--repeat 2'
+          - os: macos-latest
+            # Hosted macOS runners have no Docker daemon; Linux runs snapshots.
+            pytest_options: '-m "not snapshot"'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      PYTEST_ADDOPTS: ${{ matrix.pytest_options }}
     steps:
       - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: '0.13.1'
+          enable-cache: true
+      - run: uv sync --locked
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -17,18 +31,8 @@ jobs:
         with:
           just-version: '1.58.0'
       - run: just ready
-  snapshots:
-    name: Herdr sidebar snapshots
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: extractions/setup-just@v4
-        with:
-          just-version: '1.58.0'
-      - run: just test-snapshots --repeat 2
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && runner.os == 'Linux'
         with:
           name: sidebar-snapshots
           path: |

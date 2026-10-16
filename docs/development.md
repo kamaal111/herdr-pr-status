@@ -1,7 +1,10 @@
 # Development
 
-Use stable Rust/Cargo and [Just](https://github.com/casey/just).
-Run `just` to list recipes. Python 3 is required for smoke tests.
+Use stable Rust/Cargo, [Just](https://github.com/casey/just), and
+[uv](https://docs.astral.sh/uv/getting-started/installation/).
+Run `uv sync --locked` to install the pinned Python 3.15.0 environment and test
+dependencies from `uv.lock`. Run `just` to list recipes. End-user installation
+still uses system Python 3 and does not require uv or pytest.
 
 ## Local plugin
 
@@ -26,24 +29,54 @@ it without deleting files. The `watch` binary command is an internal entrypoint.
 ## Checks
 
 ```sh
+just test
 just ready
 ```
 
-This runs formatting checks, Clippy with warnings denied, Rust tests, a release
-build, and Python smoke tests. Tests use temporary repositories, linked worktrees,
-fake Herdr/`gh` executables, and Unix sockets. They require no network,
-credentials, running Herdr server, or access to your plugin registry.
-For individual checks, use `just quality`, `just test`, or `just test-smoke`.
+`just test` runs all Rust tests and one pytest invocation covering every Python
+suite, including installer syntax and real sidebar snapshots. `just ready` adds
+formatting checks and Clippy with warnings denied. Docker must be running;
+pytest builds the release binary once and prepares the pinned snapshot image
+automatically. There are no separate suite-specific test recipes.
 
-With Docker running, also run:
+`uv run --locked pytest` runs all Python tests directly with the same automatic
+setup. Use standard pytest selection when debugging, for example
+`uv run --locked pytest tests/test_configure.py` or `-k legacy`. Tests use pytest
+fixtures and plain assertions, including `pytest.raises` for expected errors.
+The shared lockfile uses a one-day minimum release age for dependency resolution.
 
-```sh
-just test-snapshots --repeat 2
-```
+Tests use temporary repositories, linked worktrees, fake Herdr/`gh` executables,
+and Unix sockets. After the initial dependency/container downloads, tests need
+no network, credentials, existing Herdr server, or access to your plugin registry.
+CI runs `just ready` on macOS and Linux. Linux includes every suite and repeats
+snapshots twice; hosted macOS runners exclude only the Docker snapshot marker
+because they have no Docker daemon. See [snapshot testing](snapshots.md) for
+baseline updates and diagnostics.
 
-Both checks must pass before publishing a sidebar change. CI runs `just ready`
-on macOS and Linux and snapshot comparisons on Linux. See
-[snapshot testing](snapshots.md) for baseline updates and diagnostics.
+## Installer and config migrations
+
+`install.sh` resolves the latest published GitHub release and asks Herdr to
+install its exact tag. It uses the installed executable's `configure` command
+for local setup. Config-only mode builds that helper from a temporary release
+source archive without registering a plugin. Publishing the first release with
+`configure` is required before the combined/config-only public installer works;
+the older `0.1.0` release supports manual config setup only.
+
+The explicit `configure` CLI is the sole owner of config writes. Watcher
+commands and startup hooks must never invoke it. `src/configure.rs` owns
+`CONFIG_VERSION`, initially 1, and state under
+`${XDG_STATE_HOME:-$HOME/.local/state}/herdr-pr-status/configs/`, keyed by the
+resolved config path. State survives plugin updates/reinstalls. Each entry
+contains a lock, `migration.json` with the full path and completed version,
+and `before-1.toml` when migration 1 changed an existing file.
+
+Do not bump `CONFIG_VERSION` for package releases, cosmetic changes, or to
+restore user customizations. Add an ordered, targeted migration and advance the
+version only when config consumption or required sidebar settings change.
+Future migrations must run only when newer than the completed version, preserve
+unrelated user edits, and record success only after atomic persistence. Add
+upgrade and rerun tests in `tests/test_configure.py`; existing first-run setup must
+remain retryable after interruption without duplicating tokens or backups.
 
 ## Maintenance behavior
 
