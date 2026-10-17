@@ -1,6 +1,6 @@
 id = "herdr-pr-status"
 name = "Herdr PR Status"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.9.5"
 description = "Show the newest associated GitHub PR number beside each workspace"
 platforms = ["macos", "linux"]
