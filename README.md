@@ -1,3 +1,7 @@
+> [!WARNING]
+> This plugin is deprecated in favor of [herdrpp](https://github.com/kamaal111/herdrpp),
+> which includes the PR status feature.
+
 # Herdr PR Status
 
 Show the newest associated GitHub pull request beside each workspace in Herdr's
